@@ -1,207 +1,94 @@
-import os
-import sys
 import random
-
-# 1. Setup SUMO Tools Environment
-if "SUMO_HOME" in os.environ:
-    sys.path.append(os.path.join(os.environ["SUMO_HOME"], "tools"))
-else:
-    # If the system environment variable is missing, throw a clean, helpful error
-    raise ImportError("SUMO_HOME environment variable not found. Please set SUMO_HOME to your SUMO installation directory.")
 import traci
+import config
+import engine
 
-# Automatically uses the directory where your new script is saved!
-WORKING_DIR = os.path.dirname(os.path.abspath(__file__))
-NET_FILE = os.path.join(WORKING_DIR, "grid.net.xml")
-ROUTES_FILE = os.path.join(WORKING_DIR, "grid_routes.rou.xml")
+# 1. Initialize fleet configuration layout
+config.setup_limited_fleet()
 
-# 2. Re-write a clean base route file containing ONLY the limited taxi fleet
-def setup_limited_fleet():
-    routes_xml = """<routes>
-        <vType id="taxi" vClass="taxi" personCapacity="4">
-            <param key="has.taxi.device" value="true"/>
-            <param key="device.taxi.pickUpDuration" value="15"/>
-            <param key="device.taxi.dropOffDuration" value="15"/>
-        </vType>
-        <trip id="taxi_0" depart="0.00" type="taxi" from="A0B0" to="D0D1"/>
-        <trip id="taxi_1" depart="0.00" type="taxi" from="C2B2" to="A0A1"/>
-        <trip id="taxi_2" depart="0.00" type="taxi" from="A2B2" to="D3C3"/>
-    </routes>"""
-    with open(ROUTES_FILE, "w") as f:
-        f.write(routes_xml)
+print("[LAUNCH] Launching Consolidated Native Ride-Pooling DRT Engine...")
+traci.start([
+    "sumo-gui",
+    "-n", config.NET_FILE,
+    "-r", config.ROUTES_FILE,
+    "--time-to-teleport", "-1",  # Force physical compliance
+    # REQUIRED for traci.vehicle.dispatchTaxi() to work at all. Without this,
+    # SUMO loads its own built-in dispatcher instead, which silently assigns
+    # reservations on its own (one passenger at a time) and rejects every
+    # dispatchTaxi() call from this script with:
+    #   "device.taxi.dispatch-algorithm 'traci' has not been loaded"
+    "--device.taxi.dispatch-algorithm", "traci",
+])
 
-setup_limited_fleet()
+# 2. Reset per-taxi commitment tracking now that we have a live connection
+engine.initialize_fleet_states()
 
-print("[LAUNCH] Launching Advanced Ride-Pooling DRT Engine...")
-traci.start(["sumo-gui", "-n", NET_FILE, "-r", ROUTES_FILE, "--device.taxi.dispatch-algorithm", "traci"])
-
-# Extract clean edge lists from your grid network file to spawn people on valid roads
+# 3. Extract edge networks
 all_edges = [e for e in traci.edge.getIDList() if not e.startswith(":")]
-
-# Simulation controls
 step = 0
 passenger_counter = 0
-SIMULATION_END_TIME = 7200  # Run sandbox for 2 hours of simulation time
-virtual_waiting_room = []   # Local cache keeping track of backlogged requests
 
-
-# =========================================================================
-#  ALNS OBJECTIVE FUNCTION
-# =========================================================================
-def calculate_itinerary_cost(taxi_id):
-    """
-    ALNS Objective Function: Evaluates the cost of a taxi's current itinerary.
-    Penalizes total stops, empty travel distance, and passenger wait times.
-    """
-    stops = traci.vehicle.getStops(taxi_id)
-    actual_tasks = [s for s in stops if "pickUp" in s.actType or "dropOff" in s.actType]
-    
-    cost = 0
-    # 1. Penalty for a long queue (More stops = more delay for passengers)
-    cost += len(actual_tasks) * 50  
-    
-    # 2. Traffic congestion/travel time penalty
-    speed = traci.vehicle.getSpeed(taxi_id)
-    if speed < 2.0:  # Taxi is struggling at a traffic light or junction
-        cost += 100
-        
-    return cost
-
-
-# =========================================================================
-#  MAIN SIMULATION LOOP
-# =========================================================================
-while step < SIMULATION_END_TIME:
+# 4. Main Step Execution Pipeline Loop
+while step < config.SIMULATION_END_TIME:
     traci.simulationStep()
-    
-    # ------------------ STEP 1: RANDOM PASSENGER GENERATION ------------------
-    if step % 15 == 0 and random.random() < 0.60:
+
+    # Randomly spawn passenger demands directly inside the active simulation step
+    if step % 20 == 0 and random.random() < 0.65:
         p_id = f"passenger_{passenger_counter}"
-        start_edge = random.choice(all_edges)
-        end_edge = random.choice(all_edges)
-        
-        while start_edge == end_edge:
-            end_edge = random.choice(all_edges)
-            
-        traci.person.add(p_id, start_edge, pos=0)
-        traci.person.appendStage(p_id, traci.simulation.findIntermodalRoute(start_edge, end_edge, modes="taxi")[0])
-        print(f"[NEW REQUEST] {p_id} wants a ride from [{start_edge}] -> [{end_edge}]")
-        passenger_counter += 1
 
-    # ------------------ STEP 2: ALNS OPTIMIZATION LAYER ------------------
-    if step % 10 == 0:
-        all_active_reservations = traci.person.getTaxiReservations(3) 
-        fleet = traci.vehicle.getTaxiFleet(-1)
-        
-        # Track completely new reservations in our virtual python backlog list
-        for res in all_active_reservations:
-            if res.id not in virtual_waiting_room and res.state == 1:
-                virtual_waiting_room.append(res.id)
-                
-        # Only run optimization if there are requests waiting in the virtual room
-        if virtual_waiting_room:
-            print(f"\n[ALNS LOOP] Optimizing assignments for {len(virtual_waiting_room)} unassigned requests...")
-            
-            # --- ALNS Step A: Destroy Operator (Removal Heuristic) ---
-            passengers_to_insert = list(virtual_waiting_room)
-            
-            # --- ALNS Step B: Repair Heuristic (Insertion Heuristic) ---
-            for res_id in passengers_to_insert:
-                try:
-                    res = next(r for r in all_active_reservations if r.id == res_id)
-                except StopIteration:
-                    if res_id in virtual_waiting_room:
-                        virtual_waiting_room.remove(res_id)
-                    continue
-                
-                # OPTIMIZATION UPGRADE: Calculate customer sidewalk waiting age duration
-                reservation_spawn_time = getattr(res, 'submissionTime', step)
-                waiting_time = step - reservation_spawn_time
-                waiting_penalty = waiting_time * 2.0  # Scalar weights older items higher
-                
-                best_taxi = None
-                best_additional_cost = float('inf')
-                
-                # Test inserting this passenger into every available taxi to find the lowest cost delta
-                for taxi_id in fleet:
-                    stops = traci.vehicle.getStops(taxi_id)
-                    task_list = [s.actType for s in stops]
-                    
-                    # Calculate how many total tasks are already assigned in this taxi's itinerary
-                    current_load = sum(1 for t in task_list if "dropOff" in t or "pickUp" in t)
-                    
-                    # CRITICAL CAPACITY CHECK: Skip this taxi if it already has 4 or more tasks lined up.
-                    if current_load >= 4:
-                        continue
-                        
-                    # SYSTEM REPAIR UPGRADE: Determine the vehicle's actual current location safely
-                    current_road = traci.vehicle.getRoadID(taxi_id)
-                    if current_road.startswith(":"):  # Handle internal junction road formatting
-                        try:
-                            current_road = traci.vehicle.getLaneID(taxi_id).split("_")[0]
-                            if current_road.startswith(":"):
-                                continue  # Bypass loop optimization sequence if completely locked inside center junction arrays
-                        except Exception:
-                            continue
-                    
-                    # UPGRADE: Query SUMO to get the exact real-time routing travel time
-                    try:
-                        route_stages = traci.simulation.findIntermodalRoute(current_road, res.fromEdge, modes="taxi")
-                        if route_stages:
-                            routing_cost = route_stages[0].travelTime
-                        else:
-                            routing_cost = 9999
-                    except Exception:
-                        routing_cost = 9999
+        # Find a valid start->end pair with a real, driveable route between
+        # them of at least 100m. This filters out two failure modes that cause
+        # passengers to get permanently stuck in currentCustomers:
+        #   1. Trips where start or end edge is currently occupied by a taxi's
+        #      routing (SUMO can't place a stop on an edge it already passed).
+        #   2. Trivially short or same-direction trips where the stop insertion
+        #      fails silently and the passenger never gets served.
+        # We try up to 10 random pairs before giving up for this step.
+        start_edge = None
+        end_edge = None
+        for _ in range(10):
+            s = random.choice(all_edges)
+            e = random.choice(all_edges)
+            if s == e:
+                continue
+            try:
+                route = traci.simulation.findRoute(s, e, vType="taxi")
+                if route.length >= 100.0:
+                    start_edge = s
+                    end_edge = e
+                    break
+            except traci.exceptions.TraCIException:
+                continue
 
-                    # Evaluate overall utility cost combining proximity, load conditions, and waiting age
-                    current_cost = calculate_itinerary_cost(taxi_id)
-                    total_calculated_cost = current_cost + routing_cost - waiting_penalty
-                    
-                    if total_calculated_cost < best_additional_cost:
-                        best_additional_cost = total_calculated_cost
-                        best_taxi = taxi_id
-                
-                # Execute assignment based on the best heuristic selection
-                if best_taxi:
-                    try:
-                        existing_stops = traci.vehicle.getStops(best_taxi)
-                        # Security validation wrapper checking that database double insertion tracking loops do not cross-post
-                        already_assigned = any(res.id in getattr(s, 'actType', '') or res.id in str(s) for s in existing_stops)
-                        
-                        if not already_assigned:
-                            print(f"[ALNS REPAIR] Inserting {res.id} into {best_taxi} (Adjusted Utility Delta: {best_additional_cost:.2f})")
-                            traci.vehicle.dispatchTaxi(best_taxi, [res.id])
-                            
-                        if res_id in virtual_waiting_room:
-                            virtual_waiting_room.remove(res_id)
-                    except (traci.exceptions.TraCIException, traci.exceptions.FatalTraCIError) as e:
-                        print(f"[SUMO REJECTION/CRASH AVOIDED] Keeping {res.id} in backlog due to junction positioning safety restrictions.")
-                        pass
+        if start_edge is None:
+            step += 1
+            continue
 
-        if virtual_waiting_room:
-            print(f"[SIDEWALK CONGESTION] {len(virtual_waiting_room)} passengers waiting in queue safely.")
+        try:
+            # Add person into the map environment, standing on start_edge
+            traci.person.add(p_id, start_edge, pos=0)
 
-    # ------------------ STEP 3: LIVE POOL VISUALIZER ------------------
+            # Send directly into our native reservation pool pipeline
+            engine.register_passenger(p_id, start_edge, end_edge)
+            print(f"[NEW DEMAND] {p_id} requested transit: [{start_edge}] -> [{end_edge}]")
+            passenger_counter += 1
+        except traci.exceptions.TraCIException as e:
+            print(f"[SPAWN ERROR] Could not add {p_id}: {e}")
+
+    # Reconcile our local taxi-plan tracking with SUMO's actual reservation
+    # table (drops fully-completed reservations, collapses picked-up ones
+    # from two occurrences to one) BEFORE we try to dispatch anything new -
+    # otherwise dispatchTaxi() gets sent stale reservation ids and SUMO
+    # rejects the whole call.
+    engine.sync_reservation_state()
+
+    # Run native dispatcher calculations
+    engine.match_and_dispatch_fleet(max_wait=1800)
+
+    # Print status every 40 steps
     if step % 40 == 0:
-        print(f"\n[STEP {step}] LIVE FLEET OCCUPANCY & EMISSION DASHBOARD:")
-        print("=" * 75)
-        for taxi_id in traci.vehicle.getTaxiFleet(-1):
-            stops = traci.vehicle.getStops(taxi_id)
-            current_road = traci.vehicle.getRoadID(taxi_id)
-            
-            task_list = [s.actType for s in stops]
-            passenger_count = sum(1 for t in task_list if "dropOff" in t)
-            
-            # UNIQUE METRICS: Extract live eco-efficiency data from the vehicle
-            fuel_ml_per_sec = traci.vehicle.getFuelConsumption(taxi_id)  # in ml/s
-            co2_mg_per_sec = traci.vehicle.getCO2Emission(taxi_id)       # in mg/s
-            
-            print(f"  * {taxi_id} @ [{current_road}] | Passengers: {passenger_count} | Queue: {task_list}")
-            print(f"    [ECO-METRICS] Fuel Consumption: {fuel_ml_per_sec:.2f} ml/s | CO2 Emissions: {co2_mg_per_sec:.2f} mg/s")
-        print("=" * 75 + "\n")
+        engine.print_dashboard_metrics()
 
     step += 1
 
 traci.close()
-print("[COMPLETE] Sandbox run complete. All networks closed cleanly.")
